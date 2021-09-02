@@ -964,7 +964,8 @@ end_per_testcase(TestCase, Config) ->
     case ?config(tc_status, Config) of
         ok ->
             %% test passed, we can cleanup
-            cleanup_per_testcase(TestCase, Config);
+            %cleanup_per_testcase(TestCase, Config);
+            ok;
         _ ->
             %% leave results alone for analysis
             ok

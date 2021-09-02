@@ -49,6 +49,9 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], [{hibernate_after, 5000}]).
 
+-spec submit(Txn :: term()) -> {TxnResult, HeightOpt} when
+    TxnResult :: ok | {error, _},
+    HeightOpt :: none | {some, non_neg_integer()}.
 submit(Txn) ->
     lager:debug("submitting txn"),
     gen_server:call(?SERVER, {submit, Txn}, infinity).
@@ -94,17 +97,18 @@ handle_call({set_group, Group}, _From, #state{group = OldGroup} = State) ->
             ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL,
                                                  {libp2p_framed_stream, server,
                                                   [blockchain_txn_handler, self(),
-                                                   fun(T) -> miner_hbbft_sidecar:submit(T) end]});
+                                                   fun(T) -> ?MODULE:submit(T) end]});
         {P, undefined} when is_pid(P) ->
             libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL)
     end,
     {reply, ok, State#state{group = Group}};
 handle_call({submit, _}, _From, #state{chain = undefined} = State) ->
     lager:debug("submission with no chain set"),
-    {reply, {error, no_chain}, State};
-handle_call({submit, _}, _From, #state{group = undefined} = State) ->
+    {reply, {{error, no_chain}, none}, State};
+handle_call({submit, _}, _From, #state{group = undefined, chain = Chain} = State) ->
     lager:debug("submission with no group set"),
-    {reply, {error, no_group}, State};
+    {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
+    {reply, {{error, no_group}, {some, Height}}, State};
 handle_call({submit, Txn}, From,
             #state{chain = Chain,
                    group = Group,
@@ -113,9 +117,10 @@ handle_call({submit, Txn}, From,
     Type = blockchain_txn:type(Txn),
     lager:debug("got submission of txn: ~s", [blockchain_txn:print(Txn)]),
     {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
+    HeightOpt = {some, Height},
     case lists:member(Type, ?InvalidTxns) of
         true ->
-            {reply, {error, invalid_txn}, State};
+            {reply, {{error, invalid_txn}, HeightOpt}, State};
         false ->
             case maps:find(Type, ?SlowTxns) of
                 {ok, Timeout} ->
@@ -136,15 +141,15 @@ handle_call({submit, Txn}, From,
                                     spawn(fun() ->
                                                 catch libp2p_group_relcast:handle_command(Group, {txn, Txn})
                                         end),
-                                    {reply, ok, State};
+                                    {reply, {ok, HeightOpt}, State};
                                 Error ->
                                     lager:warning("speculative absorb failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),
-                                    {reply, Error, State}
+                                    {reply, {Error, HeightOpt}, State}
                             end;
                         Error ->
                             write_txn("failed", Height, Txn),
                             lager:debug("is_valid failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),
-                            {reply, Error, State}
+                            {reply, {Error, HeightOpt}, State}
                     end
             end
     end;
