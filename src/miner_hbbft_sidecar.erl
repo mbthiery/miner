@@ -96,12 +96,12 @@ handle_call({set_group, Group}, _From, #state{group = OldGroup} = State) ->
         {P1, P2} when is_pid(P1) andalso is_pid(P2)  ->
             ok;
         {undefined, P} when is_pid(P) ->
-            ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL,
+            ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2,
                                                  {libp2p_framed_stream, server,
                                                   [blockchain_txn_handler, self(),
                                                    fun(T) -> ?MODULE:submit(T) end]});
         {P, undefined} when is_pid(P) ->
-            libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL)
+            libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2)
     end,
     {reply, ok, State#state{group = Group}};
 handle_call({submit, _}, _From, #state{chain = undefined} = State) ->
@@ -110,7 +110,7 @@ handle_call({submit, _}, _From, #state{chain = undefined} = State) ->
 handle_call({submit, _}, _From, #state{group = undefined, chain = Chain} = State) ->
     lager:debug("submission with no group set"),
     {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
-    {reply, {{error, no_group}, {some, Height}}, State};
+    {reply, {{error, no_group}, Height}, State};
 handle_call({submit, Txn}, From,
             #state{chain = Chain,
                    group = Group,
