@@ -99,10 +99,15 @@ handle_call({set_group, Group}, _From, #state{group = OldGroup} = State) ->
         {undefined, P} when is_pid(P) ->
             ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2,
                                                  {libp2p_framed_stream, server,
-                                                  [blockchain_txn_handler, self(),
+                                                  [blockchain_txn_handler, ?TX_PROTOCOL_V2, self(),
+                                                   fun(T) -> ?MODULE:submit(T) end]}),
+            ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V1,
+                                                 {libp2p_framed_stream, server,
+                                                  [blockchain_txn_handler, ?TX_PROTOCOL_V1, self(),
                                                    fun(T) -> ?MODULE:submit(T) end]});
         {P, undefined} when is_pid(P) ->
-            libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2)
+            libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2),
+            libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V1)
     end,
     {reply, ok, State#state{group = Group}};
 handle_call({submit, _}, _From, #state{chain = undefined} = State) ->
