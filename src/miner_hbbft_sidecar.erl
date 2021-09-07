@@ -31,14 +31,15 @@
          monitor :: reference(),
          pid :: pid(),
          txn :: blockchain_txn:txn(),
-         from :: {pid(), term()} % gen server doesn't export this?!?!
+         from :: {pid(), term()}, % gen server doesn't export this?!?!
+         height :: non_neg_integer()
         }).
 
 -record(state,
         {
          chain :: undefined | blockchain:blockchain(),
          group :: undefined | pid(),
-         queue = [] :: [blockchain_txn:txn()],
+         queue = [] :: [{pid(), blockchain_txn:txn(), non_neg_integer()}],
          validations = #{} :: #{reference() => #validation{}}
         }).
 
@@ -128,10 +129,10 @@ handle_call({submit, Txn}, From,
                     Limit = application:get_env(miner, sidecar_parallelism_limit, 3),
                     case maps:size(Validations) of
                         N when N >= Limit ->
-                            Queue1 = Queue ++ [{From, Txn}],
+                            Queue1 = Queue ++ [{From, Txn, Height}],
                             {noreply, State#state{queue = Queue1}};
                         _ ->
-                            {Attempt, V} = start_validation(Txn, From, Timeout, Chain),
+                            {Attempt, V} = start_validation(Txn, Height, From, Timeout, Chain),
                             {noreply, State#state{validations = Validations#{Attempt => V}}}
                     end;
                 error ->
@@ -188,7 +189,7 @@ handle_cast(_Msg, State) ->
     lager:warning("unexpected cast ~p", [_Msg]),
     {noreply, State}.
 
-handle_info({Ref, Res}, #state{validations = Validations, chain = Chain, group = Group} = State)
+handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chain, group = Group} = State)
   when is_reference(Ref) ->
     {ok, Height} = blockchain_ledger_v1:current_height(blockchain:ledger(Chain)),
     case maps:get(Ref, Validations, undefined) of
@@ -196,7 +197,7 @@ handle_info({Ref, Res}, #state{validations = Validations, chain = Chain, group =
             lager:warning("response for unknown ref"),
             {noreply, State};
         #validation{from = From, pid = Pid, txn = Txn, monitor = MRef} ->
-            Reply =
+            Result =
                 case Res of
                     ok ->
                         case blockchain_txn:absorb(Txn, Chain) of
@@ -221,7 +222,7 @@ handle_info({Ref, Res}, #state{validations = Validations, chain = Chain, group =
                         Error
                 end,
             erlang:demonitor(MRef, [flush]),
-            gen_server:reply(From, Reply),
+            gen_server:reply(From, {Result, Height}),
             Validations1 = maps:remove(Ref, Validations),
             {noreply, maybe_start_validation(State#state{validations = Validations1})}
     end;
@@ -297,27 +298,29 @@ maybe_start_validation(#state{queue = Queue, chain = Chain,
     case Queue of
         [] ->
             State;
-        [{From, Txn} | Queue1] ->
+        [{From, Txn, Height} | Queue1] ->
             Type = blockchain_txn:type(Txn),
             Timeout = maps:get(Type, ?SlowTxns, application:get_env(miner, txn_validation_budget_ms, 10000)),
-            {Attempt, V} = start_validation(Txn, From, Timeout, Chain),
+            {Attempt, V} = start_validation(Txn, Height, From, Timeout, Chain),
             Validations1 = Validations#{Attempt => V},
             State#state{validations = Validations1, queue = Queue1}
     end.
 
-start_validation(Txn, From, Timeout, Chain) ->
+start_validation(Txn, Height, From, Timeout, Chain) ->
     Owner = self(),
     Attempt = make_ref(),
     {Pid, Ref} =
         spawn_monitor(
           fun() ->
-                  case blockchain_txn:is_valid(Txn, Chain) of
-                      ok ->
-                          Owner ! {Attempt, ok};
-                      Error ->
-                          lager:debug("hbbft_handler is_valid failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),
-                          Owner ! {Attempt, {error, Error}}
-                  end
+                  Result =
+                      case blockchain_txn:is_valid(Txn, Chain) of
+                          ok ->
+                              ok;
+                          Error ->
+                              lager:debug("hbbft_handler is_valid failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),
+                              {error, Error}
+                      end,
+                    Owner ! {Attempt, {Result, Height}}
           end),
     TRef = erlang:send_after(Timeout, self(), {Attempt, deadline}),
     {Attempt,
