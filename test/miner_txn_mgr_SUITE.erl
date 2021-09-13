@@ -3,7 +3,10 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("kernel/include/inet.hrl").
+
 -include_lib("blockchain/include/blockchain_vars.hrl").
+-include_lib("blockchain/include/blockchain.hrl").
+
 -include("miner_ct_macros.hrl").
 
 -export([
@@ -19,7 +22,8 @@
          txn_out_of_sequence_nonce_test/1,
          txn_invalid_nonce_test/1,
          txn_dependent_test/1,
-         txn_from_future_test/1
+         txn_from_future_via_protocol_v1_test/1,
+         txn_from_future_via_protocol_v2_test/1
 
         ]).
 
@@ -30,7 +34,8 @@ all() -> [
           txn_out_of_sequence_nonce_test,
           txn_invalid_nonce_test,
           txn_dependent_test,
-          txn_from_future_test
+          txn_from_future_via_protocol_v1_test,
+          txn_from_future_via_protocol_v2_test
          ].
 
 init_per_suite(Config) ->
@@ -352,7 +357,87 @@ txn_dependent_test(Config) ->
 
     ok.
 
-txn_from_future_test(Cfg) ->
+txn_from_future_via_protocol_v2_test(Cfg) ->
+    txn_from_future_test(
+        fun() -> ok end,
+        fun(A, TxnHash) ->
+            %% In V2 mode, with temporal data available, we expect for the
+            %% rejection from the future to be identified as such, and
+            %% deferred:
+            ?assertMatch([_|_], fetch_deferred_rejections(A, TxnHash))
+        end,
+        fun(A, TxnHash) ->
+            %% Finally, we expect the deferred transaction to have been
+            %% dequeued:
+            ?assertMatch([], fetch_deferred_rejections(A, TxnHash))
+        end,
+        fun(A_SubmissionResult) ->
+            %% Expecting ok, not error,
+            %% BECAUSE the reason for B's rejection of T was that
+            %% T is already in B's chain,
+            %% so A is expected to have fired its T submission callback
+            %% during the sync with B,
+            %% after being unlocked, and
+            %% upon receiving a block containing T.
+            %% See calls to purge_block_txns_from_cache/1 within blockchain_txn_mgr.
+            ?assertMatch(ok, A_SubmissionResult)
+        end,
+        Cfg
+    ).
+
+txn_from_future_via_protocol_v1_test(Cfg) ->
+    Miners = ?config(consensus_miners, Cfg),
+    DoInit =
+        fun() ->
+            %% Remove V2 handlers so only V1 is available:
+            lists:foreach(
+                fun(M) ->
+                    Swarm = ct_rpc:call(M, blockchain_swarm, tid, [], 2000),
+                    ct_rpc:call(
+                        M,
+                        libp2p_swarm,
+                        remove_stream_handler,
+                        [Swarm, ?TX_PROTOCOL_V2]
+                    )
+                end,
+                Miners
+            )
+        end,
+    AssertDeferredRejections1 =
+        fun(LaggingNode, TxnHash) ->
+            %% V1 loses temporal data, so a lagging node cannot tell that the
+            %% rejection came from the future, so it assumes it came from the
+            %% present, thus a deferral never occurs:
+            ?assertMatch([], fetch_deferred_rejections(LaggingNode, TxnHash))
+        end,
+    AssertDeferredRejections2 =
+        fun(LaggingNode, TxnHash) ->
+            %% We expect deferrals to remain empty:
+            ?assertMatch([], fetch_deferred_rejections(LaggingNode, TxnHash))
+        end,
+    AssertSubmissionCallbackResult =
+        fun(LaggingNodeSubmissionResult) ->
+            ct:pal(
+                ">>> LaggingNodeSubmissionResult: ~p",
+                [LaggingNodeSubmissionResult]
+            ),
+            ?assertMatch({error, _}, LaggingNodeSubmissionResult)
+        end,
+    txn_from_future_test(
+        DoInit,
+        AssertDeferredRejections1,
+        AssertDeferredRejections2,
+        AssertSubmissionCallbackResult,
+        Cfg
+    ).
+
+txn_from_future_test(
+    DoInit,
+    AssertDeferredRejections1,
+    AssertDeferredRejections2,
+    AssertSubmissionCallbackResult,
+    Cfg
+) ->
     %% Premise:
     %%   A node A at height H
     %%   should not count a rejection from a peer B at height H+K,
@@ -394,8 +479,6 @@ txn_from_future_test(Cfg) ->
     %% the expected things to take place:
     HeightDelta = 2,
 
-    ok = miner_ct_utils:confirm_balance(Miners, A_Addr, AmountStart),
-    ok = miner_ct_utils:confirm_balance(Miners, B_Addr, AmountStart),
     Txn =
         (fun() ->
             Nonce = A_Nonce0 + 1,
@@ -404,8 +487,15 @@ txn_from_future_test(Cfg) ->
         end)(),
     TxnHash = blockchain_txn:hash(Txn),
 
+    %% Custom conditions
+    ok = DoInit(),
+
     %% Begin at the same height:
     _ = miner_ct_utils:wait_for_equalized_heights(Miners),
+
+    %% Begin with the same balance:
+    ok = miner_ct_utils:confirm_balance(Miners, A_Addr, AmountStart),
+    ok = miner_ct_utils:confirm_balance(Miners, B_Addr, AmountStart),
 
     %% Prevent A from syncing chain with peers:
     A_LockRef = node_lock(A),
@@ -455,7 +545,7 @@ txn_from_future_test(Cfg) ->
     ),
 
     %% Since B advanced already, A should have received B's rejection already:
-    ?assertMatch([_|_], fetch_deferred_rejections(A, TxnHash)),
+    AssertDeferredRejections1(A, TxnHash),
 
     %% A did not yet process T
     receive {A_SubmissionRef, _} -> ?assert(false) after 0 -> ok end,
@@ -468,21 +558,12 @@ txn_from_future_test(Cfg) ->
     %% Assert A processed T
     receive
         {A_SubmissionRef, A_SubmissionResult} ->
-            %% Expecting ok, not error,
-            %% BECAUSE the reason for B's rejection of T was that
-            %% T is already in B's chain,
-            %% so A is expected to have fired its T submission callback
-            %% during the sync with B,
-            %% after being unlocked, and
-            %% upon receiving a block containing T.
-            %% See calls to purge_block_txns_from_cache/1 within blockchain_txn_mgr.
-            ?assertMatch(ok, A_SubmissionResult)
+            AssertSubmissionCallbackResult(A_SubmissionResult)
     after 0 ->
         ?assert(false)
     end,
 
-    %% Assert A processed deferred rejections of T:
-    ?assertMatch([], fetch_deferred_rejections(A, TxnHash)),
+    AssertDeferredRejections2(A, TxnHash),
 
     ok.
 
